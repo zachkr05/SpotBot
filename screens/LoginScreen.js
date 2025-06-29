@@ -23,7 +23,7 @@ const discovery = {
   tokenEndpoint: "https://accounts.spotify.com/api/token",
 };
 
-const CLIENT_ID = "#";
+const CLIENT_ID = "";
 const SCOPES = [
   "user-read-email",
   "user-library-read",
