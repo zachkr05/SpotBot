@@ -14,8 +14,12 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
+import { useNavigation } from '@react-navigation/native';
+
+const CLIENT_ID = "602ac32e57a3499bbc9d6cebd5418250";
 
 const HomeScreen = () => {
+  const navigation = useNavigation();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [topTracks, setTopTracks] = useState([]);
@@ -27,62 +31,183 @@ const HomeScreen = () => {
     fetchAnalytics();
   }, [timeRange]);
 
+  /**
+   * Get a valid access token, refreshing if necessary
+   */
+  const getValidToken = async () => {
+    try {
+      const [[, token], [, refreshToken], [, expirationDate]] = await AsyncStorage.multiGet([
+        "token",
+        "refreshToken", 
+        "expirationDate"
+      ]);
+
+      console.log("DEBUG ▶︎ Token check:", { 
+        hasToken: !!token, 
+        hasRefreshToken: !!refreshToken,
+        expirationDate: expirationDate ? new Date(Number(expirationDate)).toISOString() : null,
+        isExpired: expirationDate ? Date.now() > Number(expirationDate) : null
+      });
+
+      if (!token) {
+        throw new Error("No access token found");
+      }
+
+      // Check if token is expired
+      if (expirationDate && Date.now() > Number(expirationDate)) {
+        console.log("DEBUG ▶︎ Token expired, attempting refresh...");
+        
+        if (!refreshToken) {
+          throw new Error("Token expired and no refresh token available");
+        }
+
+        // Refresh the token
+        const newToken = await refreshAccessToken(refreshToken);
+        return newToken;
+      }
+
+      return token;
+    } catch (error) {
+      console.error("Error getting valid token:", error);
+      throw error;
+    }
+  };
+
+  /**
+   * Refresh the access token using refresh token
+   */
+  const refreshAccessToken = async (refreshToken) => {
+    try {
+      console.log("DEBUG ▶︎ Attempting to refresh token...");
+      const response = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: CLIENT_ID,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error("DEBUG ▶︎ Token refresh failed:", errorData);
+        throw new Error(`Token refresh failed: ${errorData.error_description || response.statusText}`);
+      }
+
+      const data = await response.json();
+      
+      // Store the new token
+      const expiry = Date.now() + data.expires_in * 1000;
+      await AsyncStorage.multiSet([
+        ["token", data.access_token],
+        ["expirationDate", String(expiry)],
+        // Keep the same refresh token if a new one wasn't provided
+        ...(data.refresh_token ? [["refreshToken", data.refresh_token]] : [])
+      ]);
+
+      console.log("DEBUG ▶︎ Token refreshed successfully");
+      return data.access_token;
+    } catch (error) {
+      console.error("Error refreshing token:", error);
+      // Clear invalid tokens
+      await AsyncStorage.multiRemove(["token", "refreshToken", "expirationDate"]);
+      throw error;
+    }
+  };
+
+  /**
+   * Make authenticated API calls to Spotify
+   */
+  const spotifyApiCall = async (endpoint) => {
+    try {
+      const token = await getValidToken();
+      
+      const url = `https://api.spotify.com/v1${endpoint}`;
+      console.log("DEBUG ▶︎ Making API call to:", url);
+      
+      const response = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      console.log("DEBUG ▶︎ API Response status:", response.status);
+
+      if (!response.ok) {
+        const errorData = await response.text();
+        console.error("DEBUG ▶︎ API Error response:", errorData);
+        
+        if (response.status === 401) {
+          // Token is invalid, clear storage and redirect to login
+          await AsyncStorage.multiRemove(["token", "refreshToken", "expirationDate"]);
+          Alert.alert(
+            "Session Expired", 
+            "Your session has expired. Please log in again.",
+            [{ text: "OK", onPress: () => navigation.navigate("Login") }]
+          );
+          throw new Error("Authentication failed - please log in again");
+        }
+        
+        throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error("API call error:", error);
+      throw error;
+    }
+  };
+
   const fetchAnalytics = async () => {
     try {
-      const token = await AsyncStorage.getItem('token');
-      if (!token) {
-        Alert.alert('Error', 'No authentication token found');
-        return;
-      }
+      console.log("DEBUG ▶︎ Starting to fetch analytics...");
 
-      // Fetch top tracks
-      const tracksResponse = await fetch(
-        `https://api.spotify.com/v1/me/top/tracks?limit=10&time_range=${timeRange}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
+      // Make all API calls with proper error handling
+      const [tracksData, artistsData, recentData] = await Promise.allSettled([
+        spotifyApiCall(`/me/top/tracks?limit=10&time_range=${timeRange}`),
+        spotifyApiCall(`/me/top/artists?limit=5&time_range=${timeRange}`),
+        spotifyApiCall('/me/player/recently-played?limit=10')
+      ]);
 
-      // Fetch top artists
-      const artistsResponse = await fetch(
-        `https://api.spotify.com/v1/me/top/artists?limit=5&time_range=${timeRange}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
-
-      // Fetch recently played
-      const recentResponse = await fetch(
-        'https://api.spotify.com/v1/me/player/recently-played?limit=10',
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
-
-      if (tracksResponse.ok && artistsResponse.ok && recentResponse.ok) {
-        const tracksData = await tracksResponse.json();
-        const artistsData = await artistsResponse.json();
-        const recentData = await recentResponse.json();
-
-        setTopTracks(tracksData.items || []);
-        setTopArtists(artistsData.items || []);
-        setRecentlyPlayed(recentData.items || []);
+      // Handle tracks data
+      if (tracksData.status === 'fulfilled') {
+        setTopTracks(tracksData.value.items || []);
+        console.log("DEBUG ▶︎ Top tracks loaded:", tracksData.value.items?.length || 0);
       } else {
-        // Handle token expiration
-        if (tracksResponse.status === 401) {
-          Alert.alert('Session Expired', 'Please log in again');
-          // Navigate to login or refresh token
-        }
+        console.error("Failed to fetch top tracks:", tracksData.reason);
+        setTopTracks([]);
       }
+
+      // Handle artists data
+      if (artistsData.status === 'fulfilled') {
+        setTopArtists(artistsData.value.items || []);
+        console.log("DEBUG ▶︎ Top artists loaded:", artistsData.value.items?.length || 0);
+      } else {
+        console.error("Failed to fetch top artists:", artistsData.reason);
+        setTopArtists([]);
+      }
+
+      // Handle recent data
+      if (recentData.status === 'fulfilled') {
+        setRecentlyPlayed(recentData.value.items || []);
+        console.log("DEBUG ▶︎ Recently played loaded:", recentData.value.items?.length || 0);
+      } else {
+        console.error("Failed to fetch recently played:", recentData.reason);
+        setRecentlyPlayed([]);
+      }
+
+      // Show error if all requests failed
+      if (tracksData.status === 'rejected' && artistsData.status === 'rejected' && recentData.status === 'rejected') {
+        Alert.alert('Error', 'Failed to fetch your Spotify data. Please try again.');
+      }
+
     } catch (error) {
       console.error('Error fetching analytics:', error);
-      Alert.alert('Error', 'Failed to fetch your Spotify data');
+      Alert.alert('Error', 'Failed to fetch your Spotify data. Please try again.');
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -197,33 +322,45 @@ const HomeScreen = () => {
         {/* Top Artists Section */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Top Artists</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-            {topArtists.map((artist, index) => (
-              <View key={artist.id}>
-                {renderArtistItem({ item: artist, index })}
-              </View>
-            ))}
-          </ScrollView>
+          {topArtists.length > 0 ? (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              {topArtists.map((artist, index) => (
+                <View key={artist.id}>
+                  {renderArtistItem({ item: artist, index })}
+                </View>
+              ))}
+            </ScrollView>
+          ) : (
+            <Text style={styles.emptyText}>No top artists data available</Text>
+          )}
         </View>
 
         {/* Top Tracks Section */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Most Played Tracks</Text>
-          {topTracks.slice(0, 5).map((track, index) => (
-            <View key={track.id}>
-              {renderTrackItem({ item: track, index })}
-            </View>
-          ))}
+          {topTracks.length > 0 ? (
+            topTracks.slice(0, 5).map((track, index) => (
+              <View key={track.id}>
+                {renderTrackItem({ item: track, index })}
+              </View>
+            ))
+          ) : (
+            <Text style={styles.emptyText}>No top tracks data available</Text>
+          )}
         </View>
 
         {/* Recently Played Section */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Recently Played</Text>
-          {recentlyPlayed.slice(0, 5).map((item, index) => (
-            <View key={`${item.track.id}-${index}`}>
-              {renderRecentItem({ item })}
-            </View>
-          ))}
+          {recentlyPlayed.length > 0 ? (
+            recentlyPlayed.slice(0, 5).map((item, index) => (
+              <View key={`${item.track.id}-${index}`}>
+                {renderRecentItem({ item })}
+              </View>
+            ))
+          ) : (
+            <Text style={styles.emptyText}>No recently played data available</Text>
+          )}
         </View>
 
         <View style={{ height: 100 }} />
@@ -287,6 +424,13 @@ const styles = StyleSheet.create({
     color: 'white',
     marginBottom: 15,
     paddingHorizontal: 20,
+  },
+  emptyText: {
+    color: 'rgba(255, 255, 255, 0.5)',
+    fontSize: 16,
+    textAlign: 'center',
+    paddingHorizontal: 20,
+    paddingVertical: 20,
   },
   trackItem: {
     flexDirection: 'row',
